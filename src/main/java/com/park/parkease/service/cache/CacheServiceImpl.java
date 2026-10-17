@@ -5,6 +5,8 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -26,16 +28,21 @@ public class CacheServiceImpl<K, V> implements CacheService<K, V> {
 
     @Override
     public <T> T lockRequest(String key, Supplier<T> operation) {
-        ReentrantLock lock = requestLocks.computeIfAbsent(
-                key,
-                ignored -> new ReentrantLock()
-        );
+        ReentrantLock lock;
+        synchronized (requestLocks) {
+            lock = requestLocks.computeIfAbsent(key, ignored -> new ReentrantLock());
+            lock.lock();
+        }
 
-        lock.lock();
         try {
             return operation.get();
         } finally {
             lock.unlock();
+            synchronized (requestLocks) {
+                if (!lock.isLocked() && !lock.hasQueuedThreads()) {
+                    requestLocks.remove(key, lock);
+                }
+            }
         }
     }
 
@@ -63,7 +70,7 @@ public class CacheServiceImpl<K, V> implements CacheService<K, V> {
     @Override
     public boolean doubleRequest(String requestId, Duration ttl) {
         long now = System.currentTimeMillis();
-        long expiresAt = now + ttl.toMillis();
+        long expiresAt = expiresAt(now, ttl);
         AtomicBoolean duplicate = new AtomicBoolean(false);
 
         requestExpirations.compute(requestId, (key, currentExpiresAt) -> {
@@ -73,6 +80,11 @@ public class CacheServiceImpl<K, V> implements CacheService<K, V> {
             }
             return expiresAt;
         });
+
+        if (!duplicate.get()) {
+            CompletableFuture.delayedExecutor(Math.max(0, ttl.toMillis()), TimeUnit.MILLISECONDS)
+                    .execute(() -> requestExpirations.remove(requestId, expiresAt));
+        }
 
         return duplicate.get();
     }
